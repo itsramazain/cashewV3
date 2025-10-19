@@ -1,0 +1,192 @@
+/**
+ * Hybrid Hedera deployment + HBAR sender (ethers v5).
+ *
+ * - Send HBAR using Hedera SDK  (@hashgraph/sdk)
+ * - Deploy TradeVault.sol via Hardhat + ethers v5
+ * - Write outputs to:
+ *     - /src/components/abi/TradeVault.json  (ABI + address for UI)
+ *     - /src/config.ts                       (single source of truth for UI in TS)
+ *
+ * Required .env (at project root):
+ *   OPERATOR_ID=0.0.x
+ *   OPERATOR_KEY=0x<ecdsa-hex>   // 0x-prefixed
+ *   CHAIN_ID=296
+ *   HEDERA_RPC=https://testnet.hashio.io/api
+ * Optional:
+ *   TARGET_ACCOUNT_ID=0.0.x
+ *   AMOUNT_HBAR=5
+ *   TREASURY_EVM_ADDRESS=0x...
+ */
+
+require("dotenv").config();
+const fs = require("fs");
+const path = require("path");
+const hre = require("hardhat"); // ethers v5 available via hre.ethers
+const {
+  Client,
+  PrivateKey,
+  TransferTransaction,
+  Hbar,
+} = require("@hashgraph/sdk");
+
+// ---------- ENV ----------
+const OPERATOR_ID = (process.env.OPERATOR_ID || "").trim();
+let OPERATOR_KEY = (process.env.OPERATOR_KEY || "").trim();
+const TARGET = (process.env.TARGET_ACCOUNT_ID || "").trim();
+const AMOUNT = Number(process.env.AMOUNT_HBAR || 0);
+const CHAIN_ID = Number(process.env.CHAIN_ID || 296);
+const HEDERA_RPC = (process.env.HEDERA_RPC || "").trim();
+const TREASURY_EVM_ADDRESS = (process.env.TREASURY_EVM_ADDRESS || "").trim();
+
+// ---------- PATHS (script is in src/components/scripts) ----------
+const SCRIPT_DIR = __dirname;
+const ROOT = path.resolve(SCRIPT_DIR, "../../.."); // project root
+const SRC_DIR = path.join(ROOT, "src");
+const ABI_OUT = path.join(SRC_DIR, "components", "abi", "TradeVault.json");
+const CONFIG_TS_OUT = path.join(SRC_DIR, "config.ts");
+
+// ---------- HELPERS ----------
+function networkFromChainId(id) {
+  if (id === 295) return "mainnet";
+  if (id === 296) return "testnet";
+  return "previewnet";
+}
+const HEDERA_NETWORK = networkFromChainId(CHAIN_ID);
+
+function ensure0x(pk) {
+  return pk.startsWith("0x") ? pk : "0x" + pk;
+}
+function isHederaAccountId(v) {
+  return /^\d+\.\d+\.\d+$/.test(v);
+}
+function parsePrivateKeyHexForHedera(hexKey) {
+  const cleaned = ensure0x(hexKey);
+  return PrivateKey.fromStringECDSA(cleaned);
+}
+
+// ---------- VALIDATION ----------
+if (!OPERATOR_ID || !OPERATOR_KEY) {
+  throw new Error("Missing OPERATOR_ID or OPERATOR_KEY in .env");
+}
+if (!isHederaAccountId(OPERATOR_ID)) {
+  throw new Error(`OPERATOR_ID must look like 0.0.x — got: ${OPERATOR_ID}`);
+}
+if (!HEDERA_RPC) {
+  throw new Error("Missing HEDERA_RPC in .env");
+}
+OPERATOR_KEY = ensure0x(OPERATOR_KEY);
+
+// ---------- SEND HBAR ----------
+async function sendHbar() {
+  if (!isHederaAccountId(TARGET)) {
+    throw new Error(`TARGET_ACCOUNT_ID must look like 0.0.x — got: ${TARGET}`);
+  }
+  if (!AMOUNT || AMOUNT <= 0) {
+    throw new Error(`AMOUNT_HBAR must be a positive number — got: ${AMOUNT}`);
+  }
+
+  const privateKey = parsePrivateKeyHexForHedera(OPERATOR_KEY);
+  const client = Client.forName(HEDERA_NETWORK);
+  client.setOperator(OPERATOR_ID, privateKey);
+
+  console.log(`Sending ${AMOUNT} HBAR from ${OPERATOR_ID} → ${TARGET} ...`);
+  const tx = await new TransferTransaction()
+    .addHbarTransfer(OPERATOR_ID, new Hbar(-AMOUNT))
+    .addHbarTransfer(TARGET, new Hbar(AMOUNT))
+    .freezeWith(client)
+    .execute(client);
+
+  const receipt = await tx.getReceipt(client);
+  console.log(`✅ Transfer status: ${receipt.status.toString()}`);
+  console.log(`Tx ID: ${tx.transactionId.toString()}`);
+}
+
+// ---------- DEPLOY CONTRACT ----------
+async function deployTradeVault() {
+  const { ethers, artifacts } = hre; // ethers v5
+  console.log(
+    `Network: ${HEDERA_NETWORK} (${HEDERA_RPC}), chainId=${CHAIN_ID}`
+  );
+  console.log("Deploying TradeVault to Hedera EVM...");
+
+  // Provider + wallet (ethers v5)
+  const provider = new ethers.providers.JsonRpcProvider(HEDERA_RPC, {
+    name: HEDERA_NETWORK,
+    chainId: CHAIN_ID,
+  });
+  const wallet = new ethers.Wallet(OPERATOR_KEY, provider);
+
+  // Read compiled artifact via Hardhat
+  const artifact = await artifacts.readArtifact("TradeVault");
+
+  // Deploy
+  const factory = new ethers.ContractFactory(
+    artifact.abi,
+    artifact.bytecode,
+    wallet
+  );
+  const contract = await factory.deploy();
+  console.log("⏳ Waiting for deployment...");
+  await contract.deployed();
+  const address = contract.address;
+  console.log(`✅ TradeVault deployed at: ${address}`);
+
+  // Ensure output folder
+  fs.mkdirSync(path.dirname(ABI_OUT), { recursive: true });
+
+  // Write ABI + address JSON for frontend
+  fs.writeFileSync(
+    ABI_OUT,
+    JSON.stringify(
+      {
+        address,
+        abi: artifact.abi,
+        network: HEDERA_NETWORK,
+        chainId: CHAIN_ID,
+      },
+      null,
+      2
+    ),
+    "utf8"
+  );
+  console.log(`📝 Wrote ABI + address to ${ABI_OUT}`);
+
+  // Write TypeScript config for UI imports
+  const ts = `// Auto-generated by deploy.js
+import type { ContractInterface } from "ethers";
+
+export const TRADEVAULT_ADDRESS: \`0x\${string}\` = "${address}";
+export const TRADEVAULT_ABI: ContractInterface = ${JSON.stringify(
+    artifact.abi,
+    null,
+    2
+  )} as const;
+
+export const HEDERA_NETWORK: "mainnet" | "testnet" | "previewnet" = "${HEDERA_NETWORK}";
+export const HEDERA_RPC = "${HEDERA_RPC}";
+export const TREASURY_EVM_ADDRESS: \`0x\${string}\` = "${
+    TREASURY_EVM_ADDRESS || "0x0000000000000000000000000000000000000000"
+  }";
+`;
+  fs.writeFileSync(CONFIG_TS_OUT, ts, "utf8");
+  console.log(`📝 Wrote TypeScript config to ${CONFIG_TS_OUT}`);
+}
+
+// ---------- MAIN ----------
+(async () => {
+  console.log(`Network: ${HEDERA_NETWORK} (chain ${CHAIN_ID})`);
+  const action = (process.argv[2] || "deploy").toLowerCase();
+
+  if (action === "send") {
+    await sendHbar();
+  } else if (action === "deploy") {
+    await deployTradeVault();
+  } else {
+    console.log('Unknown action. Use "deploy" (default) or "send".');
+  }
+
+  console.log("✅ Done.");
+})().catch((e) => {
+  console.error("❌ Error:", e?.stack || e?.message || e);
+  process.exit(1);
+});
